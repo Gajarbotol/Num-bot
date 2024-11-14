@@ -59,6 +59,7 @@ bot.on('text', async (ctx) => {
         ctx.reply('You do not have permission to perform this action.');
     } else {
         if (/^[0-9]+$/.test(text)) {
+            await ctx.replyWithChatAction('typing'); // Indicate typing action
             const result = await lookupNumber(text);
             ctx.reply(result, { parse_mode: 'Markdown' });
         } else {
