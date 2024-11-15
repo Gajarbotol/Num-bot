@@ -1,29 +1,80 @@
-const { Telegraf } = require('telegraf');
-const fetch = require('node-fetch');
-const { JSDOM } = require('jsdom');
-const express = require('express');
+import { Telegraf } from 'telegraf';
+import admin from 'firebase-admin';
+import express from 'express';
+import path from 'path';
+import fetch from 'node-fetch';
+import { JSDOM } from 'jsdom';
+
+// Initialize Firebase Admin SDK
+const serviceAccount = JSON.parse(await fs.promises.readFile(new URL('./serviceAccountKey.json', import.meta.url)));
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+});
+
+const db = admin.firestore();
 
 // Configuration
 const BOT_TOKEN = '8197408803:AAGiCs9p-BkgiK7gynahWhgVKpVGDldzF70'; // Replace with your actual bot token
-const ADMIN_ID = '5197344486'; // Replace with your Telegram user ID
+const ADMIN_ID = 5197344486; // Replace with your Telegram user ID
+const CHANNELS = ['@gajarbotolx', '@gajarbotolxchat']; // Replace with your channel usernames
+const PORT = process.env.PORT || 3000;
 
 // Initialize Express app
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 const bot = new Telegraf(BOT_TOKEN);
 const users = new Set(); // Use a Set to store unique user IDs
 
+// Initialize user if not exists in Firestore
+async function initializeUser(chatId) {
+    const userRef = db.collection('users').doc(chatId.toString());
+    const doc = await userRef.get();
+
+    if (!doc.exists) {
+        await userRef.set({
+            points: 5,
+            referrals: 0,
+            isReferred: false,
+            referredUsers: [],
+            joinedChannels: false
+        });
+    }
+}
+
+// Check if the user has joined both channels
+async function hasJoinedChannels(userId) {
+    try {
+        const results = await Promise.all(CHANNELS.map(channel =>
+            bot.telegram.getChatMember(channel, userId)
+        ));
+        return results.every(result => ['member', 'administrator', 'creator'].includes(result.status));
+    } catch (error) {
+        console.error('Error checking channel membership:', error);
+        return false;
+    }
+}
+
+// Function to handle private chat messages only
+function isPrivateChat(ctx) {
+    return ctx.chat && ctx.chat.type === 'private';
+}
+
 // Start command
-bot.start((ctx) => {
+bot.start(async (ctx) => {
+    if (!isPrivateChat(ctx)) return; // Ignore if not a private chat
+    
     const userId = ctx.from.id;
+    await initializeUser(userId);
     users.add(userId); // Add user to the set
 
     const keyboard = userId == ADMIN_ID ? [
         [{ text: '🔍 Number Lookup' }],
-        [{ text: '👥 View Users' }, { text: '📢 Broadcast' }]
+        [{ text: '💰 Balance' }, { text: '🏷️ Buy Points' }],
+        [{ text: '👥 View Users' }, { text: '📢 Broadcast' }],
+        [{ text: '🔗 Refer & Earn' }]
     ] : [
-        [{ text: '🔍 Number Lookup' }]
+        [{ text: '🔍 Number Lookup' }],
+        [{ text: '💰 Balance' }, { text: '🏷️ Buy Points' }],
+        [{ text: '🔗 Refer & Earn' }]
     ];
 
     ctx.reply(`Welcome! 😊 What would you like to do?`, {
@@ -35,36 +86,170 @@ bot.start((ctx) => {
     });
 });
 
-// Handle text messages
+// Handle /start with referral
+bot.onText(/\/start(\s(\d+))?/, async (msg, match) => {
+    if (msg.chat.type !== 'private') return; // Ignore if not a private chat
+
+    const chatId = msg.chat.id;
+    await initializeUser(chatId);
+
+    const referrerId = match[2] ? parseInt(match[2]) : null;
+    const userRef = db.collection('users').doc(chatId.toString());
+    const userDoc = await userRef.get();
+    const userData = userDoc.data();
+
+    if (referrerId && referrerId !== chatId) {
+        const referrerRef = db.collection('users').doc(referrerId.toString());
+        const referrerDoc = await referrerRef.get();
+
+        if (referrerDoc.exists && !userData.isReferred) {
+            await referrerRef.update({
+                points: admin.firestore.FieldValue.increment(2),
+                referrals: admin.firestore.FieldValue.increment(1),
+                referredUsers: admin.firestore.FieldValue.arrayUnion(chatId)
+            });
+            await userRef.update({ isReferred: true });
+
+            bot.telegram.sendMessage(referrerId, "🎉 You've earned 2 points for referring a new user!");
+        }
+    }
+
+    const inlineKeyboard = [
+        [{ text: 'Join Channel One', url: `https://t.me/${CHANNELS[0].slice(1)}` }],
+        [{ text: 'Join Channel Two', url: `https://t.me/${CHANNELS[1].slice(1)}` }],
+        [{ text: '✅ Check Membership', callback_data: 'check_membership' }]
+    ];
+
+    bot.telegram.sendMessage(chatId, "Please join the following channels to start using the bot:", {
+        reply_markup: { inline_keyboard: inlineKeyboard }
+    }).then(sentMessage => {
+        userRef.update({ joinMessageId: sentMessage.message_id });
+    });
+});
+
+// Handle callback queries
+bot.on('callback_query', async (callbackQuery) => {
+    const chatId = callbackQuery.message.chat.id;
+    if (callbackQuery.message.chat.type !== 'private') return; // Ignore if not a private chat
+
+    const data = callbackQuery.data;
+
+    if (data === 'check_membership') {
+        const joined = await hasJoinedChannels(chatId);
+        const userRef = db.collection('users').doc(chatId.toString());
+        const userDoc = await userRef.get();
+        const userData = userDoc.data();
+
+        if (joined) {
+            // Delete the join message
+            if (userData.joinMessageId) {
+                bot.telegram.deleteMessage(chatId, userData.joinMessageId).catch(error => {
+                    console.error('Error deleting message:', error);
+                });
+            }
+
+            await userRef.update({ joinedChannels: true });
+
+            bot.telegram.answerCallbackQuery(callbackQuery.id, { text: 'You have successfully joined both channels!' });
+            bot.telegram.sendMessage(chatId, "Welcome! 😊 What would you like to do?", {
+                reply_markup: {
+                    keyboard: [
+                        [{ text: '🔍 Number Lookup' }],
+                        [{ text: '💰 Balance' }, { text: '🏷️ Buy Points' }],
+                        [{ text: '🔗 Refer & Earn' }]
+                    ],
+                    resize_keyboard: true
+                }
+            });
+        } else {
+            bot.telegram.answerCallbackQuery(callbackQuery.id, { text: 'Please join both channels before proceeding.', show_alert: true });
+        }
+    }
+});
+
+// Handle text commands
 bot.on('text', async (ctx) => {
+    if (!isPrivateChat(ctx)) return; // Ignore if not a private chat
+    
     const userId = ctx.from.id;
     const text = ctx.message.text;
 
-    if (text === '🔍 Number Lookup') {
-        ctx.reply('Please enter the number you want to look up:');
-    } else if (text === '👥 View Users' && userId == ADMIN_ID) {
-        ctx.reply(`Users: ${Array.from(users).join(', ')}`);
-    } else if (text === '📢 Broadcast' && userId == ADMIN_ID) {
-        ctx.reply('Please enter your broadcast message:');
-        bot.once('text', async (ctx) => {
-            const broadcastMessage = ctx.message.text;
-            users.forEach(userId => {
-                if (userId != ADMIN_ID) {
-                    bot.telegram.sendMessage(userId, `📢 Broadcast: ${broadcastMessage}`);
+    switch (text) {
+        case '🔗 Refer & Earn':
+            const referralLink = `https://t.me/NUM_LOOKUP_BYROBOT?start=${userId}`;
+            const inlineKeyboard = [
+                [{ text: '👥 My Referrals', callback_data: 'my_referrals' }],
+                [{ text: '🏆 Top 10 Referrers', callback_data: 'leaderboard' }]
+            ];
+            ctx.reply(`Share this link to refer others and earn points:\n${referralLink}\nEach referral earns you 2 points!`, {
+                reply_markup: { inline_keyboard: inlineKeyboard }
+            });
+            break;
+
+        case '💰 Balance':
+            db.collection('users').doc(userId.toString()).get().then(doc => {
+                if (doc.exists) {
+                    const user = doc.data();
+                    ctx.reply(`Your current balance is ${user.points} points.\nReferrals: ${user.referrals}`);
                 }
             });
-            ctx.reply('Broadcast sent!');
-        });
-    } else if (userId != ADMIN_ID && (text === '📢 Broadcast' || text === '👥 View Users')) {
-        ctx.reply('You do not have permission to perform this action.');
-    } else {
-        if (/^[0-9]+$/.test(text)) {
-            await ctx.replyWithChatAction('typing'); // Indicate typing action
-            const result = await lookupNumber(text);
-            ctx.reply(result, { parse_mode: 'Markdown' });
-        } else {
-            ctx.reply('Please enter a valid command or number.');
-        }
+            break;
+
+        case '🔍 Number Lookup':
+            db.collection('users').doc(userId.toString()).get().then(async doc => {
+                if (doc.exists) {
+                    const user = doc.data();
+                    if (user.points > 0) {
+                        await db.collection('users').doc(userId.toString()).update({ points: admin.firestore.FieldValue.increment(-1) });
+                        ctx.reply('Please enter the number you want to look up.');
+                    } else {
+                        ctx.reply('You do not have enough points. Use "🏷️ Buy Points" to get more.');
+                    }
+                }
+            });
+            break;
+
+        case '🏷️ Buy Points':
+            ctx.reply('Please contact the admin to buy points.');
+            break;
+
+        case '👥 View Users':
+            if (userId === ADMIN_ID) {
+                db.collection('users').get().then(snapshot => {
+                    let userList = '';
+                    snapshot.forEach(doc => {
+                        const data = doc.data();
+                        userList += `${doc.id}: ${data.points} points, ${data.referrals} referrals, Referred: ${data.isReferred ? 'Yes' : 'No'}\n`;
+                    });
+                    ctx.reply(`Users:\n${userList}`);
+                });
+            }
+            break;
+
+        case '📢 Broadcast':
+            if (userId === ADMIN_ID) {
+                ctx.reply('Please enter your broadcast message:');
+                bot.once('text', async (ctx) => {
+                    const broadcastMessage = ctx.message.text;
+                    users.forEach(userId => {
+                        if (userId != ADMIN_ID) {
+                            bot.telegram.sendMessage(userId, `📢 Broadcast: ${broadcastMessage}`);
+                        }
+                    });
+                    ctx.reply('Broadcast sent!');
+                });
+            }
+            break;
+
+        default:
+            if (/^[0-9]+$/.test(text)) {
+                // Handle number lookup after user has entered a number
+                await ctx.replyWithChatAction('typing'); // Indicate typing action
+                const result = await lookupNumber(text);
+                ctx.reply(result, { parse_mode: 'Markdown' });
+            } else {
+                ctx.reply('Please enter a valid command or number.');
+            }
     }
 });
 
